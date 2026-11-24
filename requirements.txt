@@ -1,0 +1,6 @@
+streamlit>=1.40
+anthropic
+supabase
+python-docx
+pandas
+pydeck
