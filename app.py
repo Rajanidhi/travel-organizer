@@ -362,7 +362,7 @@ with tab_chat:
             "hotel nights if you notice them. You may also give general travel advice.")
         with st.chat_message("assistant"):
             try:
-                with core.claude().messages.stream(model=core.MODEL, max_tokens=2000,
+                with core.claude().messages.stream(model=core.main.model(), max_tokens=2000,
                                                    system=system_prompt,
                                                    messages=history) as stream:
                     reply = st.write_stream(stream.text_stream)
