@@ -60,6 +60,30 @@ def db():
     return create_client(setting("SUPABASE_URL"), setting("SUPABASE_KEY"))
 
 
+@lru_cache(maxsize=4)
+def resolve_model(preferred, family):
+    """Use the preferred model if it exists; otherwise pick the newest
+    available model of the same family ('sonnet' or 'haiku')."""
+    try:
+        ids = [m.id for m in claude().models.list(limit=100)]   # newest first
+    except Exception:
+        return preferred
+    if preferred in ids:
+        return preferred
+    for model_id in ids:
+        if family in model_id:
+            return model_id
+    return ids[0] if ids else preferred
+
+
+def main_model():
+    return resolve_model(MODEL, "sonnet")
+
+
+def fast_model():
+    return resolve_model(FAST_MODEL, "haiku")
+
+
 # ============================================================
 #  READING FILES AND EMAILS
 # ============================================================
@@ -190,7 +214,7 @@ Rules:
 
 def extract_reservations(blocks):
     prompt = EXTRACT_PROMPT.replace("TODAY", date.today().isoformat())
-    text = _ask(MODEL, blocks + [{"type": "text", "text": prompt}], 8000)
+    text = _ask(main_model(), blocks + [{"type": "text", "text": prompt}], 8000)
     items = _json_between(text, "[", "]", [])
     return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
 
@@ -210,7 +234,7 @@ def geocode_many(places):
     for i in range(0, len(unique), 30):
         chunk = unique[i:i + 30]
         listing = "\n".join(f"{n + 1}. {p}" for n, p in enumerate(chunk))
-        text = _ask(FAST_MODEL, GEO_PROMPT.format(n=len(chunk), places=listing), 1500)
+        text = _ask(fast_model(), GEO_PROMPT.format(n=len(chunk), places=listing), 1500)
         coords = _json_between(text, "[", "]", [])
         if not isinstance(coords, list) or len(coords) != len(chunk):
             continue
