@@ -1,5 +1,5 @@
 # ============================================================
-#  core.py - the "engine" of the Travel Organizer (version 3.4).
+#  core.py - the "engine" of the Travel Organizer (version 3.5).
 #  Used by app.py (the website) and check_email.py.
 #  You normally never need to edit this file.
 # ============================================================
@@ -41,11 +41,11 @@ MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 # Approximate Claude prices in US dollars per million tokens: (reading, writing).
 # Used only for the cost meter. Check https://www.anthropic.com/pricing if they change.
-PRICES = {"haiku": (1.5, 7.5), "sonnet": (3.0, 15.0), "opus": (5.0, 25.0)}
+PRICES = {"haiku": (1.0, 5.0), "sonnet": (3.0, 15.0), "opus": (5.0, 25.0)}
 DETAIL_LIMIT = 160   # characters of booking notes sent to the cheaper assistant tools
 
 # Maximum length (tokens) Claude may write for each text tool.
-TEXT_LIMITS = {"health": 3000, "packing": 4000, "gaps": 6000, "phrases": 6000}
+TEXT_LIMITS = {"health": 4000, "packing": 5000, "gaps": 8000, "phrases": 8000}
 
 
 def setting(name, default=""):
@@ -762,18 +762,26 @@ INSIGHT_PROMPTS = {
     "packing": """Create a practical packing list for this trip. Consider the destinations,
 the dates/season and likely weather, the length of the trip and the activities in the bookings.
 Travellers: {travellers}. Extra notes: {notes}.
+Keep it concise: at most about 60 items in total, one short line per item.
 Group it into sections with headings (Documents & money, Clothing, Toiletries, Electronics,
 Health, Activity-specific, Kids - only if relevant). Use '- [ ] item' lines with quantities
 where useful. Finish with 3-5 short tips specific to this trip. Respond in Markdown only.""",
 
-    "gaps": """Go through the schedule day by day and find free time of roughly 3 hours or more
-during the daytime (about 08:00-22:00). Allow for travel to/from airports and stations,
-check-in/check-out, and rest after long or overnight journeys.
-For each free slot give: the day and approximate time window, where the traveller will be
-(based on their hotel or latest booking), and 3 suggestions nearby - what it is, why it's good,
-rough travel time and rough cost. Say when something should be booked in advance, and remind
-them to check opening hours. Traveller interests: {notes}.
-If the schedule is fully booked, say so. Markdown, with a heading per day.""",
+    "gaps": """Find free time in this schedule and suggest what to do with it.
+Be brief: about 900 words at most in total.
+Free time means roughly 3 hours or more during the daytime (about 08:00-22:00). Allow for
+travel to/from airports and stations, check-in/check-out, and rest after long or overnight
+journeys.
+If there are many free slots, cover only the 8 longest ones, then list the other free slots
+in one final line starting with 'Other free time:'.
+For each free slot write:
+- a '### ' heading with the day and approximate time window,
+- one short line saying where the traveller will be (based on their hotel or latest booking),
+- exactly 3 bullets, ONE line each, in this format:
+  - **Name** - why it's good · about X min away · rough cost (add '· book ahead' if needed)
+Traveller interests: {notes}.
+If the schedule is fully booked, say so in one line.
+End with this line: 'Check opening hours before you go.'""",
 
     "health": """Do a quick, practical check of this itinerary.
 Be brief: about 600 words at most in total, short bullet points only, no long explanations.
@@ -792,13 +800,14 @@ End with this line: 'Always confirm entry rules on official government websites.
 
     "phrases": """Work out which countries this trip visits and their main local languages.
 Skip languages the traveller already speaks: {languages}.
-For each language give a Markdown table of about 20 useful phrases with the columns:
+Cover at most 4 languages (those of the countries where the traveller spends the most time).
+For each language give a Markdown table of about 15 useful phrases with the columns:
 English | Local language (in local script) | How to say it (simple English pronunciation).
 Include greetings, please/thank you, sorry/excuse me, do you speak English, numbers 1-10 (one row),
 how much is this, the bill please, where is the toilet, help, I am allergic to..., directions,
 and phrases related to these bookings (e.g. hotel check-in, taxi to the airport).
-Add 3 quick etiquette tips per country. If the traveller already speaks the languages of
-every destination, say so and give local etiquette tips instead.""",
+Add 3 quick etiquette tips per country, one line each. If the traveller already speaks the
+languages of every destination, say so and give local etiquette tips instead.""",
 
     "cost": """Find the price of each reservation, if it is mentioned in any field (especially 'details').
 Return ONLY a JSON array with one item per reservation that has a price:
