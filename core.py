@@ -1,5 +1,5 @@
 # ============================================================
-#  core.py - the "engine" of the Travel Organizer (version 3.2).
+#  core.py - the "engine" of the Travel Organizer (version 3.3).
 #  Used by app.py (the website) and check_email.py.
 #  You normally never need to edit this file.
 # ============================================================
@@ -38,6 +38,11 @@ MAX_TEXT = 60000
 IMAP_HOST = "imap.gmail.com"
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+# Approximate Claude prices in US dollars per million tokens: (reading, writing).
+# Used only for the cost meter. Check https://www.anthropic.com/pricing if they change.
+PRICES = {"haiku": (1.0, 5.0), "sonnet": (3.0, 15.0), "opus": (5.0, 25.0)}
+DETAIL_LIMIT = 160   # characters of booking notes sent to the cheaper assistant tools
 
 
 def setting(name, default=""):
@@ -203,12 +208,53 @@ def file_to_blocks(name, data):
 
 
 # ============================================================
+#  COST METER
+# ============================================================
+def record_usage(meter, model, usage):
+    """Add one Claude call's token counts to a meter (a simple list)."""
+    if meter is None or usage is None:
+        return
+    meter.append({"model": str(model or ""),
+                  "input": int(getattr(usage, "input_tokens", 0) or 0),
+                  "output": int(getattr(usage, "output_tokens", 0) or 0)})
+
+
+def price_for(model_id):
+    m = str(model_id or "").lower()
+    for family, p in PRICES.items():
+        if family in m:
+            return p
+    return PRICES["sonnet"]
+
+
+def meter_cents(meter):
+    total = 0.0
+    for m in meter or []:
+        p_in, p_out = price_for(m["model"])
+        total += (m["input"] * p_in + m["output"] * p_out) / 1_000_000 * 100
+    return total
+
+
+def meter_summary(meter):
+    """e.g. 'Model: claude-haiku-4-5 · read 3,812 + wrote 2,460 tokens · about 1.6 cents'"""
+    if not meter:
+        return ""
+    models = ", ".join(sorted({m["model"] for m in meter if m["model"]})) or "unknown"
+    read = sum(m["input"] for m in meter)
+    wrote = sum(m["output"] for m in meter)
+    return (f"Model: {models} · read {read:,} + wrote {wrote:,} tokens · "
+            f"about {meter_cents(meter):.1f} cents (estimate)")
+
+
+# ============================================================
 #  CLAUDE HELPERS
 # ============================================================
-def ask(content, max_tokens=3000, model=None):
+def ask(content, max_tokens=3000, model=None, meter=None):
+    model = model or main_model()
     response = claude().messages.create(
-        model=model or main_model(), max_tokens=max_tokens,
+        model=model, max_tokens=max_tokens,
         messages=[{"role": "user", "content": content}])
+    record_usage(meter, getattr(response, "model", None) or model, response.usage)
     return "".join(b.text for b in response.content if b.type == "text")
 
 
@@ -220,6 +266,26 @@ def _json_between(text, open_ch, close_ch, default):
         return json.loads(text[start:end + 1])
     except json.JSONDecodeError:
         return default
+
+
+def _json_list(text):
+    """Read a JSON list of objects. If the answer was cut off part-way,
+    keep the items that were complete instead of losing everything."""
+    items = _json_between(text, "[", "]", None)
+    if isinstance(items, list):
+        return [i for i in items if isinstance(i, dict)]
+    start = text.find("[")
+    if start == -1:
+        return []
+    body = text[start:]
+    cut = body.rfind("},")
+    while cut > 0:
+        try:
+            items = json.loads(body[:cut + 1] + "]")
+            return [i for i in items if isinstance(i, dict)]
+        except json.JSONDecodeError:
+            cut = body.rfind("},", 0, cut)
+    return []
 
 
 EXTRACT_PROMPT = """You are a travel assistant. Read the reservation document(s) above
@@ -250,11 +316,10 @@ Rules:
 """
 
 
-def extract_reservations(blocks):
+def extract_reservations(blocks, meter=None):
     prompt = EXTRACT_PROMPT.replace("TODAY", today_local().isoformat())
-    text = ask(blocks + [{"type": "text", "text": prompt}], 8000)
-    items = _json_between(text, "[", "]", [])
-    return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+    text = ask(blocks + [{"type": "text", "text": prompt}], 8000, meter=meter)
+    return _json_list(text)
 
 
 GEO_PROMPT = """Give the approximate latitude and longitude for each numbered place below.
@@ -741,10 +806,11 @@ least one food experience per area. Do not suggest things that are already booke
 Choose a sensible suggested_date when the traveller is actually in that area (use the
 reservations), preferring days that are not already busy. Consider the season, the weather
 and the days places are usually closed.
+Keep every text short: description at most 25 words; why and tip at most 15 words each.
 Return ONLY a JSON array (no markdown, no explanation). Each item:
 {"place": "city or area", "name": "name of the place or experience",
  "category": "sightseeing|food|nature|culture|shopping|nightlife|family|adventure|relaxation",
- "description": "1-2 sentences", "why": "why it suits this traveller and trip",
+ "description": "1-2 short sentences", "why": "why it suits this traveller and trip",
  "address": "address or area, good enough to search on a map",
  "suggested_date": "YYYY-MM-DD or null", "best_time": "e.g. 'early morning', 'sunset'",
  "duration_hours": number, "approx_cost": "e.g. 'Free' or 'about EUR 20 per person'",
@@ -752,14 +818,24 @@ Return ONLY a JSON array (no markdown, no explanation). Each item:
 }
 
 
-def trip_context(trip_name, rows):
-    slim = [{"id": r.get("id"), **{f: r.get(f) for f in FIELDS}} for r in rows]
+def trip_context(trip_name, rows, full=True):
+    """The trip's bookings as compact text for Claude.
+    full=False: long notes are shortened and empty fields left out (cheaper)."""
+    slim = []
+    for r in rows:
+        item = {"id": r.get("id"), **{f: r.get(f) for f in FIELDS}}
+        if not full:
+            det = str(item.get("details") or "")
+            item["details"] = det[:DETAIL_LIMIT] + "…" if len(det) > DETAIL_LIMIT else det
+            item = {k: v for k, v in item.items() if v not in (None, "")}
+        slim.append(item)
+    data = json.dumps(slim, default=str, ensure_ascii=False, separators=(",", ":"))
     return (f"Trip name: {trip_name}\nToday's date: {today_local().isoformat()}\n"
             "Times are local times at each place.\n"
-            f"Reservations (JSON):\n{json.dumps(slim, default=str, ensure_ascii=False)}\n\n")
+            f"Reservations (JSON):\n{data}\n\n")
 
 
-def run_insight(kind, trip_name, rows, **inputs):
+def run_insight(kind, trip_name, rows, meter=None, **inputs):
     values = {k: (str(v).strip() if v else "") or "not specified" for k, v in inputs.items()}
     if kind == "health":
         values["facts"] = json.dumps(trip_facts(rows), default=str)
@@ -767,17 +843,23 @@ def run_insight(kind, trip_name, rows, **inputs):
     for key in ("travellers", "notes", "passport", "languages", "facts",
                 "place", "budget", "count"):
         prompt = prompt.replace("{" + key + "}", values.get(key, "not specified"))
-    prompt = trip_context(trip_name, rows) + prompt
+    # Cost summary and health check need every detail; the other tools get a short version.
+    full = kind in ("cost", "health")
+    prompt = trip_context(trip_name, rows, full=full) + prompt
     # Cheaper model if the ASSISTANT_MODEL secret is "haiku".
     # The health check always uses the main model (visa advice needs extra care).
     cheap = setting("ASSISTANT_MODEL", "sonnet").strip().lower() == "haiku"
     model = fast_model() if cheap and kind != "health" else main_model()
-    if kind in ("cost", "activities"):
-        limit = 8000 if kind == "activities" else 3000
-        items = _json_between(ask(prompt, limit, model), "[", "]", [])
-        items = [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
-        return json.dumps(items, ensure_ascii=False)
-    return ask(prompt, 6000, model)
+    if kind == "activities":
+        try:
+            count = int(values.get("count", "10"))
+        except ValueError:
+            count = 10
+        limit = min(8000, 700 + count * 450)     # room for about this many ideas
+        return json.dumps(_json_list(ask(prompt, limit, model, meter)), ensure_ascii=False)
+    if kind == "cost":
+        return json.dumps(_json_list(ask(prompt, 3000, model, meter)), ensure_ascii=False)
+    return ask(prompt, 6000, model, meter)
 
 
 def load_insights(trip_id):
