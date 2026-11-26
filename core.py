@@ -1,5 +1,5 @@
 # ============================================================
-#  core.py - the "engine" of the Travel Organizer (version 3.3).
+#  core.py - the "engine" of the Travel Organizer (version 3.4).
 #  Used by app.py (the website) and check_email.py.
 #  You normally never need to edit this file.
 # ============================================================
@@ -25,8 +25,8 @@ from anthropic import Anthropic
 from supabase import create_client
 
 # ---------- Settings ----------
-MODEL = "claude-sonnet-4-5"       # preferred model for reading, chat and the assistant
-FAST_MODEL = "claude-haiku-4-5"   # preferred cheaper model (map, optional assistant)
+MODEL = "claude-sonnet-4-5"       # preferred model for reading and chat (newest Sonnet is used if missing)
+FAST_MODEL = "claude-haiku-4-5"   # preferred cheaper model (newest Haiku is used if missing)
 FIELDS = ["type", "title", "start_date", "start_time", "end_date", "end_time",
           "location", "confirmation_number", "provider", "details"]
 TYPE_ICONS = {"flight": "✈️", "hotel": "🏨", "car": "🚗", "train": "🚆",
@@ -41,8 +41,11 @@ MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 # Approximate Claude prices in US dollars per million tokens: (reading, writing).
 # Used only for the cost meter. Check https://www.anthropic.com/pricing if they change.
-PRICES = {"haiku": (1.0, 5.0), "sonnet": (3.0, 15.0), "opus": (5.0, 25.0)}
+PRICES = {"haiku": (1.5, 7.5), "sonnet": (3.0, 15.0), "opus": (5.0, 25.0)}
 DETAIL_LIMIT = 160   # characters of booking notes sent to the cheaper assistant tools
+
+# Maximum length (tokens) Claude may write for each text tool.
+TEXT_LIMITS = {"health": 3000, "packing": 4000, "gaps": 6000, "phrases": 6000}
 
 
 def setting(name, default=""):
@@ -210,13 +213,14 @@ def file_to_blocks(name, data):
 # ============================================================
 #  COST METER
 # ============================================================
-def record_usage(meter, model, usage):
+def record_usage(meter, model, usage, stop_reason=None):
     """Add one Claude call's token counts to a meter (a simple list)."""
     if meter is None or usage is None:
         return
     meter.append({"model": str(model or ""),
                   "input": int(getattr(usage, "input_tokens", 0) or 0),
-                  "output": int(getattr(usage, "output_tokens", 0) or 0)})
+                  "output": int(getattr(usage, "output_tokens", 0) or 0),
+                  "cut_off": stop_reason == "max_tokens"})
 
 
 def price_for(model_id):
@@ -242,8 +246,11 @@ def meter_summary(meter):
     models = ", ".join(sorted({m["model"] for m in meter if m["model"]})) or "unknown"
     read = sum(m["input"] for m in meter)
     wrote = sum(m["output"] for m in meter)
-    return (f"Model: {models} · read {read:,} + wrote {wrote:,} tokens · "
+    text = (f"Model: {models} · read {read:,} + wrote {wrote:,} tokens · "
             f"about {meter_cents(meter):.1f} cents (estimate)")
+    if any(m.get("cut_off") for m in meter):
+        text += " · ⚠️ answer hit the length limit"
+    return text
 
 
 # ============================================================
@@ -254,8 +261,11 @@ def ask(content, max_tokens=3000, model=None, meter=None):
     response = claude().messages.create(
         model=model, max_tokens=max_tokens,
         messages=[{"role": "user", "content": content}])
-    record_usage(meter, getattr(response, "model", None) or model, response.usage)
-    return "".join(b.text for b in response.content if b.type == "text")
+    record_usage(meter, getattr(response, "model", None) or model, response.usage,
+                 getattr(response, "stop_reason", None))
+    # Only the visible text is used (any internal "thinking" parts are skipped).
+    return "".join(getattr(b, "text", "") or "" for b in response.content
+                   if getattr(b, "type", "") == "text")
 
 
 def _json_between(text, open_ch, close_ch, default):
@@ -765,18 +775,20 @@ rough travel time and rough cost. Say when something should be booked in advance
 them to check opening hours. Traveller interests: {notes}.
 If the schedule is fully booked, say so. Markdown, with a heading per day.""",
 
-    "health": """Do a careful health check of this itinerary.
+    "health": """Do a quick, practical check of this itinerary.
+Be brief: about 600 words at most in total, short bullet points only, no long explanations.
 Facts calculated by the app (reliable): {facts}
-Check for: tight connections (under ~1 h domestic / ~2 h international between flights, or from
-arrival to the next departure), overlapping bookings, hotel check-out after departure or check-in
-long after arrival, nights without accommodation, bookings missing dates/times/confirmation
-numbers, missing transfers (e.g. airport to hotel) and anything else unusual.
-Then give travel-document reminders for travellers holding a passport from: {passport}.
-Cover passport validity (many countries require 6 months), visas/e-visas and transit visas.
+Look for real problems only: tight connections (under ~1 h domestic / ~2 h international
+between flights, or from arrival to the next departure), overlapping bookings, hotel check-out
+after departure, check-in long after arrival, nights without accommodation, missing transfers
+(e.g. airport to hotel), and bookings missing dates, times or confirmation numbers.
+Travel documents for passport holders from: {passport} - passport validity (often 6 months
+beyond the trip) and whether a visa, e-visa or transit visa is likely needed for each country.
 If the passport country is not specified, give general advice and say rules depend on nationality.
-Always tell them to confirm entry rules on the official government website, as rules change.
-Markdown with these sections: '🔴 Problems', '🟡 Worth checking', '🛂 Documents & entry rules',
-'🟢 Looks good'. Be specific and mention dates and booking titles.""",
+Use exactly these Markdown sections, each with at most 6 bullets:
+'### 🔴 Problems', '### 🟡 Worth checking', '### 🛂 Documents & entry rules', '### 🟢 Looks good'.
+Write 'None found' under a section if it is empty. Mention dates and booking titles.
+End with this line: 'Always confirm entry rules on official government websites.'""",
 
     "phrases": """Work out which countries this trip visits and their main local languages.
 Skip languages the traveller already speaks: {languages}.
@@ -801,12 +813,12 @@ Area to focus on: {place}
 (If it says 'all places', cover every city or area the traveller stays in or visits,
 spread fairly across them.)
 Traveller interests: {notes}. Who is travelling: {travellers}. Budget level: {budget}.
-Give about {count} suggestions. Mix famous highlights with local favourites, and include at
+Give exactly {count} suggestions. Mix famous highlights with local favourites, and include at
 least one food experience per area. Do not suggest things that are already booked.
 Choose a sensible suggested_date when the traveller is actually in that area (use the
 reservations), preferring days that are not already busy. Consider the season, the weather
 and the days places are usually closed.
-Keep every text short: description at most 25 words; why and tip at most 15 words each.
+Keep every text short: description at most 20 words; why and tip at most 12 words each.
 Return ONLY a JSON array (no markdown, no explanation). Each item:
 {"place": "city or area", "name": "name of the place or experience",
  "category": "sightseeing|food|nature|culture|shopping|nightlife|family|adventure|relaxation",
@@ -835,7 +847,18 @@ def trip_context(trip_name, rows, full=True):
             f"Reservations (JSON):\n{data}\n\n")
 
 
+def _use_cheap_model(kind):
+    """Which model each tool uses (controlled by Streamlit secrets):
+    ASSISTANT_MODEL = "haiku"     -> cheaper model for all tools except the health check
+    HEALTH_CHECK_MODEL = "haiku"  -> cheaper model for the health check too"""
+    if kind == "health":
+        return setting("HEALTH_CHECK_MODEL", "sonnet").strip().lower() == "haiku"
+    return setting("ASSISTANT_MODEL", "sonnet").strip().lower() == "haiku"
+
+
 def run_insight(kind, trip_name, rows, meter=None, **inputs):
+    """Run one Trip Assistant tool. Raises an error (so nothing is saved)
+    if Claude returns an empty answer."""
     values = {k: (str(v).strip() if v else "") or "not specified" for k, v in inputs.items()}
     if kind == "health":
         values["facts"] = json.dumps(trip_facts(rows), default=str)
@@ -846,20 +869,34 @@ def run_insight(kind, trip_name, rows, meter=None, **inputs):
     # Cost summary and health check need every detail; the other tools get a short version.
     full = kind in ("cost", "health")
     prompt = trip_context(trip_name, rows, full=full) + prompt
-    # Cheaper model if the ASSISTANT_MODEL secret is "haiku".
-    # The health check always uses the main model (visa advice needs extra care).
-    cheap = setting("ASSISTANT_MODEL", "sonnet").strip().lower() == "haiku"
-    model = fast_model() if cheap and kind != "health" else main_model()
+    model = fast_model() if _use_cheap_model(kind) else main_model()
+    if meter is None:
+        meter = []
+
     if kind == "activities":
         try:
             count = int(values.get("count", "10"))
         except ValueError:
             count = 10
-        limit = min(8000, 700 + count * 450)     # room for about this many ideas
-        return json.dumps(_json_list(ask(prompt, limit, model, meter)), ensure_ascii=False)
+        limit = min(10000, 1000 + count * 600)     # comfortable room for this many ideas
+        items = _json_list(ask(prompt, limit, model, meter))
+        if not items:
+            raise RuntimeError("Claude returned no suggestions, so nothing was saved. "
+                               "Please click Generate again.")
+        return json.dumps(items, ensure_ascii=False)
+
     if kind == "cost":
+        # An empty list is a valid answer here (it means no prices were found).
         return json.dumps(_json_list(ask(prompt, 3000, model, meter)), ensure_ascii=False)
-    return ask(prompt, 6000, model, meter)
+
+    text = ask(prompt, TEXT_LIMITS.get(kind, 6000), model, meter).strip()
+    if not text:
+        raise RuntimeError("Claude returned an empty answer, so nothing was saved "
+                           "(your previous result is kept). Please click Generate again.")
+    if meter and meter[-1].get("cut_off"):
+        text += ("\n\n---\n⚠️ *This answer reached its length limit and may be incomplete. "
+                 "Click Regenerate to try again.*")
+    return text
 
 
 def load_insights(trip_id):
