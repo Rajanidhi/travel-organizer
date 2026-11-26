@@ -1,5 +1,5 @@
 # ============================================================
-#  TRAVEL ORGANIZER v3.1 - the website (what people see).
+#  TRAVEL ORGANIZER v3.3 - the website (what people see).
 #  The "engine" is in core.py
 # ============================================================
 import json
@@ -378,17 +378,18 @@ with tab_add:
         if not files and not pasted.strip():
             st.warning("Please upload a file or paste some text first.")
         else:
-            found, sources = [], []
+            found, sources, meter = [], [], []
             with st.spinner("Claude is reading your documents…"):
                 for f in files or []:
                     try:
-                        found += core.extract_reservations(core.file_to_blocks(f.name, f.getvalue()))
+                        found += core.extract_reservations(
+                            core.file_to_blocks(f.name, f.getvalue()), meter=meter)
                         sources.append(f.name)
                     except Exception as e:
                         st.error(f"Could not read {f.name}: {e}")
                 if pasted.strip():
                     try:
-                        found += core.extract_reservations([core.text_block(pasted)])
+                        found += core.extract_reservations([core.text_block(pasted)], meter=meter)
                         sources.append("pasted text")
                     except Exception as e:
                         st.error(f"Could not read pasted text: {e}")
@@ -397,12 +398,17 @@ with tab_add:
                 st.session_state.review_table = df
                 st.session_state.review_source = ", ".join(sources)
                 st.session_state.review_trip = trip_id
+                st.session_state.review_cost = core.meter_summary(meter)
             else:
                 st.warning("Claude didn't find any reservations in that content.")
+                if meter:
+                    st.caption("💰 " + core.meter_summary(meter))
 
     if "review_table" in st.session_state:
         target_trip = st.session_state.get("review_trip", trip_id)
         st.subheader(f"✅ Check the details, then save to **{trip_names.get(target_trip, trip['name'])}**")
+        if st.session_state.get("review_cost"):
+            st.caption("💰 Reading cost: " + st.session_state.review_cost)
         st.caption("Click any cell to edit it. Dates must look like 2025-07-14, times like 14:30.")
         edited = st.data_editor(st.session_state.review_table, num_rows="dynamic", key="editor")
         col_a, col_b = st.columns(2)
@@ -412,11 +418,13 @@ with tab_add:
                     res = core.save_reservations(edited.to_dict("records"),
                                                  st.session_state.review_source, target_trip)
                 del st.session_state["review_table"]
+                st.session_state.pop("review_cost", None)
                 show_save_result(res)
             except Exception as e:
                 st.error(f"Save failed: {e}")
         if col_b.button("✖️ Discard"):
             del st.session_state["review_table"]
+            st.session_state.pop("review_cost", None)
             st.rerun()
 
     st.divider()
@@ -537,7 +545,11 @@ with tab_chat:
                                                    system=system_prompt,
                                                    messages=history) as stream:
                     reply = st.write_stream(stream.text_stream)
+                    final = stream.get_final_message()
                 history.append({"role": "assistant", "content": reply})
+                chat_meter = []
+                core.record_usage(chat_meter, final.model, final.usage)
+                st.caption("💰 " + core.meter_summary(chat_meter))
             except Exception as e:
                 history.pop()
                 st.error(f"Claude error: {e}")
@@ -689,7 +701,8 @@ with tab_ai:
             c3, c4 = st.columns(2)
             inputs["budget"] = c3.select_slider("Budget", ["Low", "Medium", "High"],
                                                 value="Medium", key="in_budget")
-            inputs["count"] = c4.slider("How many ideas", 5, 20, 10, key="in_count")
+            inputs["count"] = c4.slider("How many ideas", 5, 20, 10, key="in_count",
+                                        help="Fewer ideas = lower cost.")
             inputs["place"] = place or "all places"
             store_key = "activities:" + (place or "all places").lower()[:80]
         elif kind == "packing":
@@ -718,13 +731,21 @@ with tab_ai:
         if st.button("🔄 Regenerate" if saved else "✨ Generate", type="primary",
                      disabled=not ready):
             with st.spinner("Claude is working on it… (about 20–60 seconds)"):
+                meter = []
                 try:
-                    content = core.run_insight(kind, trip["name"], rows, **inputs)
+                    content = core.run_insight(kind, trip["name"], rows, meter=meter, **inputs)
                     core.save_insight(trip_id, store_key, content)
                     saved = {"content": content,
                              "updated_at": datetime.now(timezone.utc).isoformat()}
                 except Exception as e:
                     st.error(f"Claude error: {e}")
+                if meter:
+                    st.session_state.setdefault("last_cost", {})[store_key] = \
+                        core.meter_summary(meter)
+
+        last_cost = st.session_state.get("last_cost", {}).get(store_key)
+        if last_cost:
+            st.info("💰 Last generation: " + last_cost)
 
         if saved:
             st.caption(f"Generated {(saved.get('updated_at') or '')[:16].replace('T', ' ')} UTC. "
