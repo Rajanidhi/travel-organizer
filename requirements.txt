@@ -4,3 +4,6 @@ supabase
 python-docx
 pandas
 pydeck
+fpdf2
+openpyxl
+tzdata
